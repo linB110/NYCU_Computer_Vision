@@ -2,17 +2,18 @@ import cv2
 import numpy as np
 
 class SfMGeometry:
-    def __init__(self, K):
+    def __init__(self, K1, K2=None):
         # camera intrinsic matrix K 
-        self.K = K
+        self.K1 = K1
+        self.K2 = K2 if K2 is not None else K1
     
     def estimate_pose(self, pts1, pts2):
         # compute RANSAC mask
-        E, mask = cv2.findEssentialMat(pts1, pts2, self.K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        E, mask = cv2.findEssentialMat(pts1, pts2, self.K1, method=cv2.RANSAC, prob=0.999, threshold=1.0)
         
         
         # compute R, t from essential matrix
-        _, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, self.K, mask=mask)
+        _, R, t, mask_pose = cv2.recoverPose(E, pts1, pts2, self.K1, mask=mask)
         
         return R, t, mask_pose
     
@@ -24,10 +25,10 @@ class SfMGeometry:
         pts2_inliers = pts2[mask.ravel() == 1]
         
         # origin : P1 = [I | 0]
-        cord1 = self.K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+        cord1 = self.K1 @ np.hstack((np.eye(3), np.zeros((3, 1))))
         
         # second camera : P2 = [R | t]
-        cord2 = self.K @ np.hstack((R, t))
+        cord2 = self.K2 @ np.hstack((R, t))
         
         # triangulate points
         pts4d_hom = cv2.triangulatePoints(cord1, cord2, pts1_inliers.T, pts2_inliers.T)
