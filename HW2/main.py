@@ -9,9 +9,14 @@ from visualizer import Visualizer
 def main():
     
     # 1. initialize and read images
-    K = np.array([[5426.566895,  0.678017,    330.096680],
+    K1 = np.array([[5426.566895,  0.678017,    330.096680],
                     [0,     5423.133301, 648.950012],
                     [0,     0,    1]])
+    
+    K2 = np.array([[5426.566895,  0.678017,    387.430023],
+                    [0,     5423.133301, 620.616699],
+                    [0,     0,    1]])
+    
     
     img1 = cv2.imread('data/Statue1.bmp')
     img2 = cv2.imread('data/Statue2.bmp')
@@ -20,11 +25,11 @@ def main():
     extractor = KeypointExtractor('SIFT')
     kp1, desc1 = extractor.extract_keypoints(img1)
     kp2, desc2 = extractor.extract_keypoints(img2)
-    print(f"提取特徵點: kp1={len(kp1)}, kp2={len(kp2)}")
+    print(f"extracted keypoints: kp1={len(kp1)}, kp2={len(kp2)}")
     
     matches = extractor.match_keypoints(desc1, desc2)
     pts1, pts2 = extractor.get_aligned_points(kp1, kp2, matches)
-    print(f"匹配點對數量: {len(matches)}")
+    print(f"matched points: {len(matches)}")
 
     # 2.1 extract color information for visualization
     colors = []
@@ -35,13 +40,13 @@ def main():
     colors = np.array(colors)
     
     # 3. estimate camera pose
-    geometry = SfMGeometry(K)
+    geometry = SfMGeometry(K1, K2)
     R, t, mask = geometry.estimate_pose(pts1, pts2)
-    print(f"RANSAC 後剩餘點數: {np.sum(mask)}")
+    print(f"after RANSAC points: {np.sum(mask)}")
 
     # 4. triangulate points
     points_3d = geometry.triangulate_points(pts1, pts2, R, t, mask)
-    print(f"三角測量總點數: {len(points_3d)}")
+    print(f"triangulate points: {len(points_3d)}")
     colors = colors[mask.ravel() > 0] 
     
     # 5. pointcloud filter
@@ -49,7 +54,7 @@ def main():
     valid_idx = points_3d[:, 2] > 0
     points_3d = points_3d[valid_idx]
     colors = colors[valid_idx]
-    print(f"過濾相機後方點後: {len(points_3d)}")
+    print(f"in front of camera points: {len(points_3d)}")
     
     # 6. visualizaation
     visualizer = Visualizer()
