@@ -7,7 +7,7 @@ import os
 from scipy.optimize import least_squares
 
 # ─────────────────────────────────────────
-# 1. 資料收集
+# 1. data collection
 # ─────────────────────────────────────────
 def collect_points(image_dir: str, corner_x: int, corner_y: int, output_dir: str = "output"):
     """
@@ -38,6 +38,7 @@ def collect_points(image_dir: str, corner_x: int, corner_y: int, output_dir: str
 
         print(f"  Finding corners: {fname}")
         ret, corners = cv2.findChessboardCorners(gray, (corner_x, corner_y), None)
+        print(f"  ret = {ret}")
 
         if ret:
             objpoints.append(objp)
@@ -277,8 +278,8 @@ def visualize_extrinsics(mtx, extrinsics, output_dir="output"):
 # 7. main : calibrate_camera()
 # ─────────────────────────────────────────
 def calibrate_camera(
-    image_dir:  str = "data",
-    corner_x:   int = 7,
+    image_dir:  str = "my_data",
+    corner_x:   int = 10,
     corner_y:   int = 7,
     output_dir: str = "output",
     visualize:  bool = True,
@@ -318,8 +319,8 @@ def calibrate_camera(
 
 if __name__ == "__main__":
     mtx, dist, extrinsics = calibrate_camera(
-        image_dir  = "data",
-        corner_x   = 7,
+        image_dir  = "my_data",
+        corner_x   = 10,
         corner_y   = 7,
         output_dir = "output",
         visualize  = True,
