@@ -5,22 +5,38 @@ from extract_keypoints import KeypointExtractor
 from geometry import SfMGeometry
 from visualizer import Visualizer
 
+# select data input file
+# given data : Mensona, Statue
+# or your own data
+MODE = "statue"  # "statue" or "mesona" or ... (TODO)
 
 def main():
     
-    # 1. initialize and read images
-    K1 = np.array([[5426.566895,  0.678017,    330.096680],
-                    [0,     5423.133301, 648.950012],
-                    [0,     0,    1]])
-    
-    K2 = np.array([[5426.566895,  0.678017,    387.430023],
-                    [0,     5423.133301, 620.616699],
-                    [0,     0,    1]])
-    
-    
-    img1 = cv2.imread('data/Statue1.bmp')
-    img2 = cv2.imread('data/Statue2.bmp')
-    
+    if MODE == "statue":
+        K1 = np.array([[5426.566895, 0.678017, 330.096680],
+                    [0, 5423.133301, 648.950012],
+                    [0, 0, 1]])
+        K2 = np.array([[5426.566895, 0.678017, 387.430023],
+                    [0, 5423.133301, 620.616699],
+                    [0, 0, 1]])
+        
+        img1 = cv2.imread('data/Statue1.bmp')
+        img2 = cv2.imread('data/Statue2.bmp')
+        tex_name = 'data/Statue1.bmp'
+
+    elif MODE == "mesona":
+        K1 = np.array([[1.4219, 0.0005, 0.5092],
+                    [0, 1.4219, 0],
+                    [0, 0, 0.0010]])
+        
+        K2 = K1.copy()
+        img1 = cv2.imread('data/Mesona1.JPG')
+        img2 = cv2.imread('data/Mesona2.JPG')
+        tex_name = 'data/Mesona1.JPG'
+    else:
+        #TODO
+        pass
+
     # 2. feature extraction and matching
     extractor = KeypointExtractor('SIFT')
     kp1, desc1 = extractor.extract_keypoints(img1)
@@ -41,7 +57,7 @@ def main():
     
     # 3. estimate camera pose
     geometry = SfMGeometry(K1, K2)
-    R, t, mask = geometry.estimate_pose(pts1, pts2)
+    R, t, mask, F = geometry.estimate_pose(pts1, pts2)
     print(f"after RANSAC points: {np.sum(mask)}")
 
     # 4. triangulate points
@@ -61,11 +77,10 @@ def main():
     inlier_points = visualizer.clean_pointclouds(points_3d, colors)
     visualizer.show_pointclouds(inlier_points)
     
-    # 7. save for matlab
     sio.savemat('sfm_data.mat', {'P': points_3d,    
                                  'p_img2': pts2[mask.ravel() > 0],    
                                  'M': np.hstack([R, t]),
-                                 'tex_name': 'data/Statue1.bmp',    'im_index': 1})
+                                 'tex_name': tex_name,    'im_index': 1})
     
 if __name__ == "__main__":
     main()
