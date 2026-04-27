@@ -1,9 +1,12 @@
 import cv2
 import numpy as np
 import scipy.io as sio
+import os
 from extract_keypoints import KeypointExtractor
 from geometry import SfMGeometry
 from visualizer import Visualizer
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # select data input file
 # given data : Mensona, Statue
@@ -38,14 +41,17 @@ def main():
         pass
 
     # 2. feature extraction and matching
-    extractor = KeypointExtractor('SIFT')
-    kp1, desc1 = extractor.extract_keypoints(img1)
-    kp2, desc2 = extractor.extract_keypoints(img2)
-    print(f"extracted keypoints: kp1={len(kp1)}, kp2={len(kp2)}")
-    
-    matches = extractor.match_keypoints(desc1, desc2)
-    pts1, pts2 = extractor.get_aligned_points(kp1, kp2, matches)
-    print(f"matched points: {len(matches)}")
+    extractor = KeypointExtractor('LOFTR')
+    if extractor.kpt_type == 'LOFTR':
+        pts1, pts2 = extractor.match_dense(img1, img2)
+        print(f"matched points (LoFTR): {len(pts1)}")
+    else:
+        kp1, desc1 = extractor.extract_keypoints(img1)
+        kp2, desc2 = extractor.extract_keypoints(img2)
+        print(f"extracted keypoints: kp1={len(kp1)}, kp2={len(kp2)}")
+        matches = extractor.match_keypoints(desc1, desc2)
+        pts1, pts2 = extractor.get_aligned_points(kp1, kp2, matches)
+        print(f"matched points: {len(matches)}")
 
     # 2.1 extract color information for visualization
     colors = []
@@ -57,7 +63,7 @@ def main():
     
     # 3. estimate camera pose
     geometry = SfMGeometry(K1, K2)
-    R, t, mask, F = geometry.estimate_pose(pts1, pts2)
+    R, t, mask = geometry.estimate_pose(pts1, pts2)
     print(f"after RANSAC points: {np.sum(mask)}")
 
     # 4. triangulate points
