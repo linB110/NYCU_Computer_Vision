@@ -4,9 +4,12 @@ import scipy.io as sio
 import os
 from extract_keypoints import KeypointExtractor
 from geometry import SfMGeometry
-from visualizer import Visualizer
+from visualization import (draw_keypoints, draw_epipolar_lines,
+                           plot_3d_points)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(_DIR, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # select data input file
 # given data : Mensona, Statue
@@ -41,7 +44,7 @@ def main():
         pass
 
     # 2. feature extraction and matching
-    extractor = KeypointExtractor('LOFTR')
+    extractor = KeypointExtractor('SIFT')
     if extractor.kpt_type == 'LOFTR':
         pts1, pts2 = extractor.match_dense(img1, img2)
         print(f"matched points (LoFTR): {len(pts1)}")
@@ -60,11 +63,24 @@ def main():
         color = img1[y, x][::-1] / 255.0
         colors.append(color)
     colors = np.array(colors)
-    
+
+    # 2.2 draw 2D keypoint scatter plots
+    draw_keypoints(img1, img2, pts1, pts2, OUTPUT_DIR)
+
     # 3. estimate camera pose
     geometry = SfMGeometry(K1, K2)
     R, t, mask = geometry.estimate_pose(pts1, pts2)
     print(f"after RANSAC points: {np.sum(mask)}")
+
+    # 3.1 draw epipolar lines
+    #     Recover F from E:  F = K2^{-T} @ E @ K1^{-1}
+    E, _ = cv2.findEssentialMat(pts1, pts2, K1, method=cv2.RANSAC,
+                                prob=0.999, threshold=1.0)
+    F = np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
+    F = F / F[2, 2]
+    pts1_inlier = pts1[mask.ravel() > 0]
+    pts2_inlier = pts2[mask.ravel() > 0]
+    draw_epipolar_lines(img1, img2, pts1_inlier, pts2_inlier, F, OUTPUT_DIR)
 
     # 4. triangulate points
     points_3d = geometry.triangulate_points(pts1, pts2, R, t, mask)
@@ -77,11 +93,18 @@ def main():
     points_3d = points_3d[valid_idx]
     colors = colors[valid_idx]
     print(f"in front of camera points: {len(points_3d)}")
+
+    # 5.1 save 3D scatter plot
+    plot_3d_points(points_3d, OUTPUT_DIR)
     
-    # 6. visualizaation
-    visualizer = Visualizer()
-    inlier_points = visualizer.clean_pointclouds(points_3d, colors)
-    visualizer.show_pointclouds(inlier_points)
+    # 6. visualization (open3d point cloud viewer)
+    try:
+        from visualizer import Visualizer
+        visualizer = Visualizer()
+        inlier_points = visualizer.clean_pointclouds(points_3d, colors)
+        visualizer.show_pointclouds(inlier_points)
+    except ImportError:
+        print("[Warning] open3d not installed, skipping 3D point cloud viewer.")
     
     sio.savemat('sfm_data.mat', {'P': points_3d,    
                                  'p_img2': pts2[mask.ravel() > 0],    
