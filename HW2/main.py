@@ -36,6 +36,15 @@ def main():
         img1 = cv2.imread('data/Mesona1.JPG')
         img2 = cv2.imread('data/Mesona2.JPG')
         tex_name = 'data/Mesona1.JPG'
+    elif MODE=="mydata":
+        K1 = np.array([[4.32963581e+03, 0 ,2.13196307e+03],
+                        [0, 4.31994272e+03 ,2.90475106e+03],
+                        [0,0 ,1]])
+        K2 = K1.copy()
+        img1 = cv2.imread('mydata/001.jpg')
+        img2 = cv2.imread('mydata/002.jpg')
+        tex_name = 'mydata/001.jpg'
+        
     else:
         #TODO
         pass
