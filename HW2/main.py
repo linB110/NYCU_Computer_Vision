@@ -4,8 +4,8 @@ import scipy.io as sio
 import os
 from extract_keypoints import KeypointExtractor
 from geometry import SfMGeometry
-from visualization import (draw_keypoints, draw_epipolar_lines,
-                           plot_3d_points)
+from visualization import (draw_sift_matches, draw_keypoints,
+                           draw_epipolar_lines, plot_3d_points)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(_DIR, "output")
@@ -61,6 +61,7 @@ def main():
         matches = extractor.match_keypoints(desc1, desc2)
         pts1, pts2 = extractor.get_aligned_points(kp1, kp2, matches)
         print(f"matched points: {len(matches)}")
+        draw_sift_matches(img1, img2, kp1, kp2, matches, OUTPUT_DIR)
 
     # 2.1 extract color information for visualization
     colors = []
