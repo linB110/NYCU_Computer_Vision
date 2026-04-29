@@ -1,143 +1,175 @@
-import cv2
+import cv2 
 import numpy as np
+
+# for BA optimization
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
 
-
 class SfMGeometry:
     def __init__(self, K1, K2=None):
+        # camera intrinsic matrix K 
         self.K1 = K1
         self.K2 = K2 if K2 is not None else K1
+    
+    def normalize_pts(self, pts):
+        """normalize points and return transformation matrix T"""
+        
+        # decenterize and scale points to have mean distance sqrt(2)
+        center = np.mean(pts, axis=0)
+        scale = np.sqrt(2) / np.mean(np.linalg.norm(pts - center, axis=1))
+        
+        T = np.array([
+            [scale,     0, -scale * center[0]],
+            [    0, scale, -scale * center[1]],
+            [    0,     0,                  1]
+        ])
+        pts_h = np.hstack((pts, np.ones((len(pts), 1))))
+        
+        return (T @ pts_h.T).T, T
 
-    # ------------------------------------------------------------------
-    # Step 2: F via normalized 8-point + RANSAC
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _normalize_points(pts):
-        # Hartley normalization: centroid -> origin, mean dist -> sqrt(2)
-        centroid = pts.mean(axis=0)
-        shifted = pts - centroid
-        mean_dist = np.sqrt((shifted ** 2).sum(axis=1)).mean()
-        scale = np.sqrt(2) / mean_dist if mean_dist > 1e-12 else 1.0
-        T = np.array([[scale, 0, -scale * centroid[0]],
-                      [0, scale, -scale * centroid[1]],
-                      [0, 0, 1]])
-        pts_h = np.hstack([pts, np.ones((len(pts), 1))])
-        pts_norm = (T @ pts_h.T).T
-        return pts_norm, T
-
-    def compute_F_normalized_8pt(self, pts1, pts2):
-        p1n, T1 = self._normalize_points(pts1)
-        p2n, T2 = self._normalize_points(pts2)
-        x1, y1 = p1n[:, 0], p1n[:, 1]
-        x2, y2 = p2n[:, 0], p2n[:, 1]
-        A = np.column_stack([x2 * x1, x2 * y1, x2,
-                             y2 * x1, y2 * y1, y2,
-                             x1, y1, np.ones_like(x1)])
-        _, _, Vt = np.linalg.svd(A)
-        F = Vt[-1].reshape(3, 3)
-        # rank-2 enforcement
-        U, S, Vt2 = np.linalg.svd(F)
+    def run_8_point(self, pts1, pts2):
+        """Normalized 8-point algorithm and estimate Fundamental Matrix F"""
+        assert len(pts1) == len(pts2) == 8
+        n1, T1 = self.normalize_pts(pts1)
+        n2, T2 = self.normalize_pts(pts2)
+        A = np.array([
+            [n2[i,0]*n1[i,0], n2[i,0]*n1[i,1], n2[i,0],
+            n2[i,1]*n1[i,0], n2[i,1]*n1[i,1], n2[i,1],
+            n1[i,0],         n1[i,1],          1]
+            for i in range(8)
+        ])
+        _, _, V = np.linalg.svd(A)
+        F = V[-1].reshape(3, 3)
+        # enforce rank-2 constraint
+        U, S, V = np.linalg.svd(F)
         S[2] = 0
-        F = U @ np.diag(S) @ Vt2
+        F = U @ np.diag(S) @ V
+        
         # denormalize
         F = T2.T @ F @ T1
-        return F / F[2, 2] if abs(F[2, 2]) > 1e-12 else F
+        
+        return F / F[2, 2]
+    
+    def sampson_distance(self, pts1, pts2, F):
+        p1 = np.hstack((pts1, np.ones((len(pts1),1))))
+        p2 = np.hstack((pts2, np.ones((len(pts2),1))))
+        Fp1 = (F @ p1.T).T
+        FTp2 = (F.T @ p2.T).T
+        
+        # ref : https://amroamroamro.github.io/mexopencv/matlab/cv.sampsonDistance.html
+        denom = Fp1[:,0]**2 + Fp1[:,1]**2 + FTp2[:,0]**2 + FTp2[:,1]**2
+        reproj_err = np.einsum('ij,ij->i', p2, (F @ p1.T).T)**2 / denom
+        
+        return reproj_err
 
-    @staticmethod
-    def _sampson_distance(F, pts1, pts2):
-        N = len(pts1)
-        p1h = np.hstack([pts1, np.ones((N, 1))])
-        p2h = np.hstack([pts2, np.ones((N, 1))])
-        Fp1 = (F @ p1h.T).T
-        Ftp2 = (F.T @ p2h.T).T
-        num = np.sum(p2h * Fp1, axis=1) ** 2
-        denom = Fp1[:, 0] ** 2 + Fp1[:, 1] ** 2 + Ftp2[:, 0] ** 2 + Ftp2[:, 1] ** 2
-        return num / np.maximum(denom, 1e-12)
-
-    def compute_F_ransac(self, pts1, pts2, threshold=1.0, iters=2000, seed=42):
-        rng = np.random.default_rng(seed)
-        N = len(pts1)
-        best_inliers = np.zeros(N, dtype=bool)
-        best_count = 0
-        for _ in range(iters):
-            idx = rng.choice(N, 8, replace=False)
+    def estimate_F_RANSAC(self, pts1, pts2, thres=1.0, max_iter=5000, conf=0.5):
+        best_F, best_mask, best_count = None, None, 0
+        n = len(pts1)
+        
+        for _ in range(max_iter):
+            idx = np.random.choice(n, 8, replace=False)
             try:
-                F_cand = self.compute_F_normalized_8pt(pts1[idx], pts2[idx])
-            except np.linalg.LinAlgError:
+                F = self.run_8_point(pts1[idx], pts2[idx])
+            except Exception:
                 continue
-            d = self._sampson_distance(F_cand, pts1, pts2)
-            inliers = d < threshold ** 2
-            count = int(inliers.sum())
-            if count > best_count:
-                best_count = count
-                best_inliers = inliers
-        # refit on the full inlier set
-        F = self.compute_F_normalized_8pt(pts1[best_inliers], pts2[best_inliers])
-        return F, best_inliers
-
-    # ------------------------------------------------------------------
-    # Step 4: 4 candidate (R, t) from E
-    # ------------------------------------------------------------------
-    @staticmethod
-    def decompose_E(E):
-        # enforce two equal singular values and a zero third
-        U, S, Vt = np.linalg.svd(E)
-        m = (S[0] + S[1]) / 2
-        E = U @ np.diag([m, m, 0]) @ Vt
-        U, _, Vt = np.linalg.svd(E)
-        # ensure proper rotations (det = +1) by flipping sign columns
-        if np.linalg.det(U) < 0:
-            U[:, -1] *= -1
-        if np.linalg.det(Vt) < 0:
-            Vt[-1, :] *= -1
-        W = np.array([[0, -1, 0],
-                      [1,  0, 0],
-                      [0,  0, 1]])
-        R1 = U @ W @ Vt
-        R2 = U @ W.T @ Vt
-        t = U[:, 2:3]
-        return [(R1, t), (R1, -t), (R2, t), (R2, -t)]
-
-    # ------------------------------------------------------------------
-    # Step 5: cheirality test to pick the right (R, t)
-    # ------------------------------------------------------------------
-    def _count_in_front(self, R, t, pts1, pts2):
-        P1 = self.K1 @ np.hstack([np.eye(3), np.zeros((3, 1))])
-        P2 = self.K2 @ np.hstack([R, t])
-        pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
-        pts3d = pts4d[:3] / pts4d[3]
-        z1 = pts3d[2]
-        z2 = (R @ pts3d + t)[2]
-        return int(np.sum((z1 > 0) & (z2 > 0)))
-
-    def estimate_pose(self, pts1, pts2):
-        # Step 2: F via normalized 8-point + RANSAC
-        F, inliers = self.compute_F_ransac(pts1, pts2, threshold=1.0)
-
-        # Essential matrix from F and intrinsics
+            err = self.sampson_distance(pts1, pts2, F)
+            mask = err < thres
+            if mask.sum() > best_count:
+                best_F, best_mask, best_count = F, mask, mask.sum()
+                if best_count >= n * conf:
+                    break  # early stop
+                
+        if best_F is None:
+            raise RuntimeError("RANSAC failed: no valid F found")
+        
+        return best_F, best_mask
+    
+    def compute_E_from_F(self, F):
+        """E = K2^T @ F @ K1 with rank-2 constraint"""
         E = self.K2.T @ F @ self.K1
+        U, S, V = np.linalg.svd(E)
+        m = (S[0] + S[1]) / 2
+        E = U @ np.diag([m, m, 0]) @ V
+        
+        return E
 
-        # Step 4 + 5: decompose E into 4 candidates, pick the one with the
-        # most points triangulated in front of both cameras.
-        in1 = pts1[inliers]
-        in2 = pts2[inliers]
-        candidates = self.decompose_E(E)
-        best = None
-        best_count = -1
-        for R, t in candidates:
-            count = self._count_in_front(R, t, in1, in2)
+    def four_solutions(self, E):
+        U, S, V = np.linalg.svd(E)
+        
+        if np.linalg.det(U @ V) < 0:
+            V = -V
+            
+        W = np.array([[0,-1,0],[1,0,0],[0,0,1]])
+        t = U[:, 2:]
+        R1 = U @ W @ V
+        R2 = U @ W.T @ V
+        
+        return [
+            np.hstack((R1,  t)), np.hstack((R1, -t)),
+            np.hstack((R2,  t)), np.hstack((R2, -t))
+        ]
+
+    def cheirality_check(self, pts1, pts2, P2_candidates):
+        """select the solution with most points in front of both cameras"""
+        P1 = self.K1 @ np.eye(3, 4)
+        best_P2, best_count = None, 0
+        
+        for P2_rel in P2_candidates:
+            P2 = self.K2 @ P2_rel
+            pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
+            pts3d = (pts4d[:3] / pts4d[3]).T
+            
+            # check if points are in front of both cameras
+            front1 = pts3d[:, 2] > 0
+            R2, t2 = P2_rel[:, :3], P2_rel[:, 3:]
+            pts_cam2 = (R2 @ pts3d.T + t2).T
+            front2 = pts_cam2[:, 2] > 0
+            count = (front1 & front2).sum()
             if count > best_count:
-                best_count = count
-                best = (R, t)
-        R, t = best
-
-        mask = inliers.astype(np.uint8).reshape(-1, 1)
-        return R, t, mask, F
-
-    # ------------------------------------------------------------------
-    # Validation
-    # ------------------------------------------------------------------
+                best_count, best_P2 = count, P2_rel
+                
+        return best_P2
+    
+    def estimate_pose(self, pts1, pts2):
+        # RANSAC + 8-point F estimation
+        F, mask = self.estimate_F_RANSAC(pts1, pts2)
+        inlier_pts1 = pts1[mask]
+        inlier_pts2 = pts2[mask]
+        
+        # E from F + 4 solutions
+        E = self.compute_E_from_F(F)
+        P2s = self.four_solutions(E)
+        
+        # Cheirality check
+        best_P2 = self.cheirality_check(inlier_pts1, inlier_pts2, P2s)
+        R, t = best_P2[:, :3], best_P2[:, 3:]
+        
+        # reconstruct full mask array for main.py compatibility
+        full_mask = mask.astype(np.uint8).reshape(-1, 1)
+        
+        return R, t.reshape(3,1), full_mask, F  
+    
+    def triangulate_points(self, pts1, pts2, R, t, mask):
+        # triangulate 3D points
+        
+        # filter out outliers using mask
+        pts1_inliers = pts1[mask.ravel() == 1]
+        pts2_inliers = pts2[mask.ravel() == 1]
+        
+        # origin : P1 = [I | 0]
+        cord1 = self.K1 @ np.hstack((np.eye(3), np.zeros((3, 1))))
+        
+        # second camera : P2 = [R | t]
+        cord2 = self.K2 @ np.hstack((R, t))
+        
+        # triangulate points
+        pts4d_hom = cv2.triangulatePoints(cord1, cord2, pts1_inliers.T, pts2_inliers.T)
+        
+        # transfer to  Cartesian coordinates
+        points_3d = pts4d_hom[:3] / pts4d_hom[3]
+        
+        return points_3d.T
+        
     def reprojection_error(self, points_3d, pts1, pts2, R, t):
         """Mean reprojection error in pixels across both views."""
         P1 = self.K1 @ np.hstack([np.eye(3), np.zeros((3, 1))])
@@ -147,6 +179,7 @@ class SfMGeometry:
             X_h = np.hstack([X, np.ones((len(X), 1))]).T  # 4xN
             x_h = P @ X_h                                 # 3xN
             x = (x_h[:2] / x_h[2]).T                      # Nx2
+            
             return x
 
         proj1 = project(P1, points_3d)
@@ -154,15 +187,16 @@ class SfMGeometry:
         err1 = np.linalg.norm(proj1 - pts1, axis=1)
         err2 = np.linalg.norm(proj2 - pts2, axis=1)
         return err1, err2
-
+    
     def check_F(self, F, pts1, pts2):
         """Algebraic error x'ᵀ F x for inlier matches — should be near 0."""
         N = len(pts1)
         p1h = np.hstack([pts1, np.ones((N, 1))])
         p2h = np.hstack([pts2, np.ones((N, 1))])
         errors = np.abs(np.sum(p2h * (F @ p1h.T).T, axis=1))
+        
         return errors
-
+    
     # ------------------------------------------------------------------
     # Bundle adjustment
     # ------------------------------------------------------------------
@@ -215,15 +249,4 @@ class SfMGeometry:
         t_opt    = result.x[3:6].reshape(3, 1)
         pts_opt  = result.x[6:].reshape(n, 3)
         return pts_opt, R_opt, t_opt
-
-    # ------------------------------------------------------------------
-    # Step 6: triangulation 
-    # ------------------------------------------------------------------
-    def triangulate_points(self, pts1, pts2, R, t, mask):
-        pts1_inliers = pts1[mask.ravel() == 1]
-        pts2_inliers = pts2[mask.ravel() == 1]
-        cord1 = self.K1 @ np.hstack((np.eye(3), np.zeros((3, 1))))
-        cord2 = self.K2 @ np.hstack((R, t))
-        pts4d_hom = cv2.triangulatePoints(cord1, cord2, pts1_inliers.T, pts2_inliers.T)
-        points_3d = pts4d_hom[:3] / pts4d_hom[3]
-        return points_3d.T
+        
