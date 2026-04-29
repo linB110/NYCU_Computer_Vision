@@ -20,8 +20,37 @@ import os
 # ============================================================
 # 1. SIFT matches — side-by-side image
 # ============================================================
+def _scores_to_bgr(scores):
+    """
+    Convert normalized correspondence scores to BGR colors.
+    Low score -> red, high score -> green.
+    """
+    scores = np.asarray(scores, dtype=np.float32)
+    scores = np.clip(scores, 0.0, 1.0)
+    colors = np.zeros((len(scores), 3), dtype=np.uint8)
+    colors[:, 1] = (scores * 255).astype(np.uint8)          # Green
+    colors[:, 2] = ((1.0 - scores) * 255).astype(np.uint8)  # Red
+    return colors
+
+
+def _match_confidence_from_distance(matches):
+    """
+    OpenCV DMatch.distance is lower for better correspondences.
+    Convert it to a 0-1 confidence so good matches become green.
+    """
+    if len(matches) == 0:
+        return np.array([], dtype=np.float32)
+
+    distances = np.array([m.distance for m in matches], dtype=np.float32)
+    d_min = float(distances.min())
+    d_max = float(distances.max())
+    if d_max - d_min < 1e-8:
+        return np.ones_like(distances, dtype=np.float32)
+    return 1.0 - (distances - d_min) / (d_max - d_min)
+
+
 def draw_sift_matches(img1, img2, kp1, kp2, good_matches, output_dir,
-                      filename="sift_matches.png"):
+                      filename="sift_matches.png", correspondence_scores=None):
     """
     Draw SIFT feature matches between two images and save the result.
 
@@ -37,6 +66,10 @@ def draw_sift_matches(img1, img2, kp1, kp2, good_matches, output_dir,
         Directory to save the output image.
     filename : str
         Output filename (default: "sift_matches.png").
+    correspondence_scores : array-like, shape (N,), optional
+        Confidence scores in [0, 1] for each match. Low scores are drawn red;
+        high scores are drawn green. If omitted, scores are inferred from
+        DMatch.distance, where smaller distance means higher confidence.
 
     Returns
     -------
@@ -45,10 +78,31 @@ def draw_sift_matches(img1, img2, kp1, kp2, good_matches, output_dir,
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    match_img = cv2.drawMatches(
-        img1, kp1, img2, kp2, good_matches, None,
-        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
-    )
+    if correspondence_scores is None:
+        correspondence_scores = _match_confidence_from_distance(good_matches)
+    else:
+        correspondence_scores = np.asarray(correspondence_scores, dtype=np.float32)
+        if len(correspondence_scores) != len(good_matches):
+            raise ValueError("correspondence_scores must have the same length as good_matches")
+
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+    out_h = max(h1, h2)
+    out_w = w1 + w2
+    match_img = np.zeros((out_h, out_w, 3), dtype=img1.dtype)
+    match_img[:h1, :w1] = img1
+    match_img[:h2, w1:w1 + w2] = img2
+
+    colors_bgr = _scores_to_bgr(correspondence_scores)
+    for match, color in zip(good_matches, colors_bgr):
+        pt1 = tuple(np.round(kp1[match.queryIdx].pt).astype(int))
+        pt2_raw = np.round(kp2[match.trainIdx].pt).astype(int)
+        pt2 = (int(pt2_raw[0] + w1), int(pt2_raw[1]))
+        color = tuple(int(v) for v in color)
+        cv2.line(match_img, pt1, pt2, color, 1, cv2.LINE_AA)
+        cv2.circle(match_img, pt1, 3, color, -1, cv2.LINE_AA)
+        cv2.circle(match_img, pt2, 3, color, -1, cv2.LINE_AA)
+
     out_path = os.path.join(output_dir, filename)
     cv2.imwrite(out_path, match_img)
     print(f"[Visualization] Saved {filename} -> {out_path}")
