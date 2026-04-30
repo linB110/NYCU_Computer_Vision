@@ -68,8 +68,10 @@ def draw_sift_matches(img1, img2, kp1, kp2, good_matches, output_dir,
         Output filename (default: "sift_matches.png").
     correspondence_scores : array-like, shape (N,), optional
         Confidence scores in [0, 1] for each match. Low scores are drawn red;
-        high scores are drawn green. If omitted, scores are inferred from
-        DMatch.distance, where smaller distance means higher confidence.
+        high scores are drawn green. In the SfM pipeline, a RANSAC inlier mask
+        is passed here so outliers are red and geometrically valid inliers are
+        green. If omitted, scores are inferred from DMatch.distance as a
+        descriptor-similarity fallback.
 
     Returns
     -------
@@ -267,7 +269,8 @@ def draw_epipolar_lines(img1, img2, pts1, pts2, F, output_dir,
 # ============================================================
 def plot_3d_points(pts3d, output_dir, filename="3d_points.png",
                    title="Triangulated 3D Points", color="steelblue",
-                   point_size=1, elev=None, azim=None):
+                   point_size=1, elev=None, azim=None,
+                   axis_percentile=(2, 98), axis_padding=0.10):
     """
     Create and save a 3D scatter plot of triangulated points.
 
@@ -287,6 +290,11 @@ def plot_3d_points(pts3d, output_dir, filename="3d_points.png",
         Marker size.
     elev, azim : float or None
         Viewing angles for the 3D plot.
+    axis_percentile : tuple(float, float) or None
+        Percentile range used only to set robust axis limits per axis. This
+        keeps outliers from stretching the plot scale without removing points.
+    axis_padding : float
+        Extra margin added to each axis range for readability.
 
     Returns
     -------
@@ -298,6 +306,16 @@ def plot_3d_points(pts3d, output_dir, filename="3d_points.png",
     ax = fig.add_subplot(111, projection="3d")
     ax.scatter(pts3d[:, 0], pts3d[:, 1], pts3d[:, 2],
                s=point_size, c=color)
+    if axis_percentile is not None and len(pts3d) > 0:
+        lower = np.percentile(pts3d, axis_percentile[0], axis=0)
+        upper = np.percentile(pts3d, axis_percentile[1], axis=0)
+        span = upper - lower
+        fallback_span = np.ptp(pts3d, axis=0)
+        span = np.where(span > 1e-8, span, fallback_span)
+        padding = np.maximum(span * axis_padding, 1e-6)
+        ax.set_xlim(lower[0] - padding[0], upper[0] + padding[0])
+        ax.set_ylim(lower[1] - padding[1], upper[1] + padding[1])
+        ax.set_zlim(lower[2] - padding[2], upper[2] + padding[2])
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")

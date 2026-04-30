@@ -14,7 +14,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # select data input file
 # given data : Mensona, Statue
 # or your own data
-MODE = "mesona"  # "statue" or "mesona" or ... (TODO)
+MODE = "my_data"  # "statue" or "mesona" or ... (TODO)
 BA = True # bundle adjustment flag
 
 def main():
@@ -40,21 +40,28 @@ def main():
         img1 = cv2.imread('data/Mesona1.JPG')
         img2 = cv2.imread('data/Mesona2.JPG')
         tex_name = 'data/Mesona1.JPG'
-    elif MODE=="mydata":
+    elif MODE=="my_data":
         K1 = np.array([[4.32963581e+03, 0 ,2.13196307e+03],
                         [0, 4.31994272e+03 ,2.90475106e+03],
                         [0,0 ,1]])
         K2 = K1.copy()
-        img1 = cv2.imread('mydata/001.jpg')
-        img2 = cv2.imread('mydata/002.jpg')
-        tex_name = 'mydata/001.jpg'
+        img1 = cv2.imread('my_data/tissue1.png')
+        img2 = cv2.imread('my_data/tissue2.png')
+        tex_name = 'my_data/tissue1.png'
         
     else:
         #TODO
         pass
 
+    if img1 is None or img2 is None:
+        raise FileNotFoundError(
+            f"Failed to read input images for MODE='{MODE}'. "
+            "Please check the image paths and file integrity."
+        )
+
     # 2. feature extraction and matching
-    extractor = KeypointExtractor('XFEAT')
+    extractor = KeypointExtractor('SIFT')
+    kp1, kp2, matches = None, None, None
     
     # handling different extractors
     if extractor.kpt_type == 'LOFTR':
@@ -70,7 +77,6 @@ def main():
         matches = extractor.match_keypoints(desc1, desc2)
         pts1, pts2 = extractor.get_aligned_points(kp1, kp2, matches)
         print(f"matched points: {len(matches)}")
-        draw_sift_matches(img1, img2, kp1, kp2, matches, OUTPUT_DIR)
 
     # 2.1 extract color information for visualization
     colors = []
@@ -87,6 +93,21 @@ def main():
     geometry = SfMGeometry(K1, K2)
     R, t, mask, F = geometry.estimate_pose(pts1, pts2)
     print(f"after RANSAC points: {np.sum(mask)}")
+    if matches is not None:
+        draw_sift_matches(
+            img1, img2, kp1, kp2, matches, OUTPUT_DIR,
+            filename="sift_matches.png",
+            correspondence_scores=mask.ravel().astype(np.float32)
+        )
+        inlier_matches = [
+            match for match, keep in zip(matches, mask.ravel())
+            if keep > 0
+        ]
+        draw_sift_matches(
+            img1, img2, kp1, kp2, inlier_matches, OUTPUT_DIR,
+            filename="sift_matches_filtered.png",
+            correspondence_scores=np.ones(len(inlier_matches), dtype=np.float32)
+        )
 
     # 3.1 draw epipolar lines
     #     Recover F from E:  F = K2^{-T} @ E @ K1^{-1}
