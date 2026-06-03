@@ -10,7 +10,8 @@ class KeypointExtractor:
     def __init__(self, kpt_type, nFeatures=3000):
         self.kpt_type = kpt_type.upper()
         self.nFeatures = nFeatures
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cpu')
         self.detector = self._get_detector()
 
     # ------------------------------------------------------------------ #
@@ -22,8 +23,6 @@ class KeypointExtractor:
             return cv2.ORB_create(self.nFeatures)
         elif self.kpt_type == 'SIFT':
             return cv2.SIFT_create(self.nFeatures)
-        elif self.kpt_type == 'SURF':
-            return cv2.xfeatures2d.SURF_create(self.nFeatures)
         elif self.kpt_type == 'BRISK':
             return cv2.BRISK_create()
         elif self.kpt_type == 'AKAZE':
@@ -77,9 +76,10 @@ class KeypointExtractor:
             return None
 
         elif self.kpt_type == 'KEYNET':
-            self._keynet_model = KF.KeyNet(pretrained=True).to(self.device).eval()
-            self._hardnet    = KF.HardNet8(pretrained=True).to(self.device).eval()
-            self._affnet     = KF.LAFAffNetShapeEstimator(pretrained=True).to(self.device).eval()
+            self.keynet_model = KF.KeyNetAffNetHardNet(
+                num_features=self.nFeatures,
+                device=self.device
+            ).eval()
             return None
 
         # ---- SuperPoint ----
@@ -96,24 +96,32 @@ class KeypointExtractor:
         elif self.kpt_type == 'R2D2':
             repo_path = pathlib.Path(__file__).parent / "r2d2"
             sys.path.insert(0, str(repo_path))
+            from extract import load_network, NonMaxSuppression, extract_multiscale
             from tools.dataloader import norm_RGB
-            from nets.r2d2 import R2D2 as R2D2Net
-            self._r2d2_model = R2D2Net()
-            ckpt = torch.load(repo_path / "models/r2d2_WASF_N16.pt", map_location=self.device)
-            self._r2d2_model.load_state_dict(ckpt['state_dict'])
-            self._r2d2_model = self._r2d2_model.to(self.device).eval()
-            self._r2d2_norm  = norm_RGB
+
+            self._r2d2_extract_multiscale = extract_multiscale
+            self._r2d2_norm = norm_RGB
+            self._r2d2_model = load_network(str(repo_path / "models/r2d2_WASF_N16.pt")).to(self.device).eval()
+            self._r2d2_detector = NonMaxSuppression(rel_thr=0.7, rep_thr=0.7)
             return None
 
         elif self.kpt_type == 'D2NET':
             repo_path = pathlib.Path(__file__).parent / "d2-net"
             sys.path.insert(0, str(repo_path))
-            from lib.model_test import D2Net as D2NetModel
-            self._d2net_model = D2NetModel(
+            from lib.model_test import D2Net
+            from lib.utils import preprocess_image
+            from lib.pyramid import process_multiscale
+
+            self._d2_preprocess = preprocess_image
+            self._d2_process_multiscale = process_multiscale
+            self._d2net_model = D2Net(
                 model_file=str(repo_path / "models/d2_tf.pth"),
                 use_relu=True,
                 use_cuda=(self.device.type == 'cuda')
             )
+            self._d2_multiscale = True
+            self._d2_max_edge = 1600
+            self._d2_max_sum_edges = 2800
             return None
 
         elif self.kpt_type == 'ALIKE':
@@ -177,7 +185,7 @@ class KeypointExtractor:
         # ============================================================
         #  Classical OpenCV (with built-in detectAndCompute)
         # ============================================================
-        elif self.kpt_type in ['ORB', 'SIFT', 'SURF', 'BRISK', 'AKAZE', 'KAZE']:
+        elif self.kpt_type in ['ORB', 'SIFT', 'BRISK', 'AKAZE', 'KAZE']:
             return self.detector.detectAndCompute(gray, None)
 
         # ============================================================
@@ -205,23 +213,26 @@ class KeypointExtractor:
 
         elif self.kpt_type == 'SUPERPOINT':
             tensor = torch.from_numpy(gray).float().unsqueeze(0).unsqueeze(0).to(self.device) / 255.0
+            
             with torch.no_grad():
                 out = self.superpoint_model({'image': tensor})
+            
+            # extract keypoints and descriptors
+             # output: keypoints [1, N, 2], descriptors [1, 256, N]
             kp_array = out['keypoints'][0].cpu().numpy()
-            desc     = out['descriptors'][0].permute(1, 0).cpu().numpy()
+            
+            desc = out['descriptors'][0].permute(1, 0).cpu().numpy()
             kps = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kp_array]
+            
             return kps, desc
 
         elif self.kpt_type == 'KEYNET':
             tensor = torch.from_numpy(gray).float().unsqueeze(0).unsqueeze(0).to(self.device) / 255.0
             with torch.no_grad():
-                lafs, _ = self._keynet_model(tensor)
-                lafs    = self._affnet(lafs, tensor)
-                patches = KF.extract_patches_from_pyramid(tensor, lafs, PS=32)
-                B, N, CH, H, W = patches.shape
-                desc = self._hardnet(patches.view(B * N, CH, H, W)).view(B, N, -1)
-            kp_array = lafs[0, :, :, 2].cpu().numpy()
-            desc_np  = desc[0].cpu().numpy()
+                lafs, responses, desc = self.keynet_model(tensor)
+
+            kp_array = KF.get_laf_center(lafs)[0].cpu().numpy()   # (N, 2)
+            desc_np = desc[0].cpu().numpy()                       # (N, D)
             kps = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kp_array]
             return kps, desc_np
 
@@ -236,21 +247,72 @@ class KeypointExtractor:
             return kps, desc
 
         elif self.kpt_type == 'R2D2':
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            from PIL import Image
+
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            pil_img = Image.fromarray(rgb)
+            tensor = self._r2d2_norm(pil_img)[None].to(self.device)
+
             with torch.no_grad():
-                res = self._r2d2_model(imgs=[tensor])
-            xys  = res['keypoints'][0].cpu().numpy()
-            desc = res['descriptors'][0].cpu().numpy()
-            kps = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in xys]
-            return kps, desc
+                xys, desc, scores = self._r2d2_extract_multiscale(
+                    self._r2d2_model, tensor, self._r2d2_detector,
+                    scale_f=2**0.25, min_scale=0.0, max_scale=1.0,
+                    min_size=256, max_size=1024, verbose=False
+                )
+
+            xys = xys.cpu().numpy()
+            desc = desc.cpu().numpy()
+            scores = scores.cpu().numpy()
+
+            idxs = np.argsort(scores)[-self.nFeatures:]
+            xys = xys[idxs]
+            desc = desc[idxs]
+
+            kps = [cv2.KeyPoint(float(x), float(y), float(s)) for x, y, s in xys]
+            return kps, desc.astype(np.float32)
 
         elif self.kpt_type == 'D2NET':
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+            import scipy
+            import scipy.misc
+
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            image = rgb.astype(np.float32)
+
+            resized_image = image
+            if max(resized_image.shape[:2]) > self._d2_max_edge:
+                resized_image = scipy.misc.imresize(
+                    resized_image,
+                    self._d2_max_edge / max(resized_image.shape[:2])
+                ).astype('float32')
+            if sum(resized_image.shape[:2]) > self._d2_max_sum_edges:
+                resized_image = scipy.misc.imresize(
+                    resized_image,
+                    self._d2_max_sum_edges / sum(resized_image.shape[:2])
+                ).astype('float32')
+
+            fact_i = image.shape[0] / resized_image.shape[0]
+            fact_j = image.shape[1] / resized_image.shape[1]
+
+            input_image = self._d2_preprocess(resized_image, preprocessing='caffe')
+            tensor = torch.tensor(input_image[np.newaxis].astype(np.float32), device=self.device)
+
             with torch.no_grad():
-                kp_array, desc, _ = self._d2net_model.detect_and_describe(rgb)
-            kps = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kp_array]
-            return kps, desc.astype(np.float32)
+                if self._d2_multiscale:
+                    keypoints, scores, descriptors = self._d2_process_multiscale(tensor, self._d2net_model)
+                else:
+                    keypoints, scores, descriptors = self._d2_process_multiscale(tensor, self._d2net_model, scales=[1])
+
+            keypoints[:, 0] *= fact_i
+            keypoints[:, 1] *= fact_j
+            keypoints = keypoints[:, [1, 0, 2]]  # u,v,s
+
+            if len(scores) > self.nFeatures:
+                idxs = np.argsort(scores)[-self.nFeatures:]
+                keypoints = keypoints[idxs]
+                descriptors = descriptors[idxs]
+
+            kps = [cv2.KeyPoint(float(x), float(y), float(s)) for x, y, s in keypoints]
+            return kps, descriptors.astype(np.float32)
 
         # ============================================================
         #  Dense matcher — no keypoints from extract_keypoints
@@ -281,19 +343,11 @@ class KeypointExtractor:
         return out['keypoints0'].cpu().numpy()[mask], out['keypoints1'].cpu().numpy()[mask]
 
     # ------------------------------------------------------------------ #
-    #  Detect + Match（XFeat only）
+    #  Detect + Match
     # ------------------------------------------------------------------ #
     def detect_and_match(self, img1, img2):
         import time
         t_start = time.perf_counter()
-
-        #  use extract_keypoints detector（ deep-learning and classical method）
-        _EXTRACT_TYPES = {
-            'ORB', 'SIFT', 'SURF', 'BRISK', 'AKAZE', 'KAZE',
-            'HARRIS', 'FAST', 'AGAST', 'MSER',
-            'DISK', 'GFTT', 'SUPERPOINT', 'KEYNET',
-            'ALIKE', 'R2D2', 'D2NET'
-        }
 
         if self.kpt_type == 'XFEAT':
             out1 = self._xfeat.detectAndCompute(img1, top_k=self.nFeatures)[0]
@@ -304,21 +358,20 @@ class KeypointExtractor:
             idxs0, idxs1 = self._xfeat.match(out1['descriptors'], out2['descriptors'], min_cossim=0.82)
             t_match = time.perf_counter() - t1
 
-            pts1   = out1['keypoints'][idxs0].cpu().numpy().astype(np.float32)
-            pts2   = out2['keypoints'][idxs1].cpu().numpy().astype(np.float32)
-            n_kp1  = len(out1['keypoints'])
-            n_kp2  = len(out2['keypoints'])
+            pts1 = out1['keypoints'][idxs0].cpu().numpy().astype(np.float32)
+            pts2 = out2['keypoints'][idxs1].cpu().numpy().astype(np.float32)
+            n_kp1, n_kp2 = len(out1['keypoints']), len(out2['keypoints'])
 
         elif self.kpt_type == 'LOFTR':
             pts1, pts2 = self.match_dense(img1, img2)
-            t_extract  = time.perf_counter() - t_start
-            t_match    = 0.0
-            n_kp1 = n_kp2 = len(pts1)
+            t_extract = time.perf_counter() - t_start
+            t_match = 0.0
+            n_kp1, n_kp2 = len(pts1), len(pts2)
 
-        elif self.kpt_type in _EXTRACT_TYPES:
+        else:
             kp1, desc1 = self.extract_keypoints(img1)
             kp2, desc2 = self.extract_keypoints(img2)
-            t_extract  = time.perf_counter() - t_start
+            t_extract = time.perf_counter() - t_start
 
             t1 = time.perf_counter()
             matches = self.match_keypoints(desc1, desc2)
@@ -327,13 +380,14 @@ class KeypointExtractor:
             pts1, pts2 = self.get_aligned_points(kp1, kp2, matches)
             n_kp1, n_kp2 = len(kp1), len(kp2)
 
-        else:
-            raise ValueError(f"detect_and_match: unsupported type {self.kpt_type}")
-
-        return pts1, pts2, {
-            'n_kp1': n_kp1, 'n_kp2': n_kp2, 'n_matches': len(pts1),
-            't_extract_s': t_extract, 't_match_s': t_match,
+        stats = {
+            'n_kp1': n_kp1,
+            'n_kp2': n_kp2,
+            'n_matches': len(pts1),
+            't_extract_s': t_extract,
+            't_match_s': t_match,
         }
+        return pts1, pts2, stats
 
     # ------------------------------------------------------------------ #
     #  Descriptor Matching
@@ -342,9 +396,9 @@ class KeypointExtractor:
         if desc1 is None or desc2 is None:
             return []
 
-        HAMMING_TYPES = {'ORB', 'BRISK', 'HARRIS', 'FAST', 'AGAST', 'MSER'}
-        L2_KNN_TYPES  = {'SIFT', 'SURF', 'DISK', 'GFTT', 'SUPERPOINT',
-                         'KEYNET', 'ALIKE', 'R2D2', 'D2NET', 'KAZE', 'AKAZE'}
+        HAMMING_TYPES = {'ORB', 'BRISK', 'HARRIS', 'FAST', 'AGAST', 'MSER', 'AKAZE'}
+        L2_KNN_TYPES  = {'SIFT', 'DISK', 'GFTT', 'SUPERPOINT',
+                         'KEYNET', 'ALIKE', 'R2D2', 'D2NET', 'KAZE'}
 
         if self.kpt_type in HAMMING_TYPES:
             bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
