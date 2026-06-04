@@ -136,6 +136,17 @@ class KeypointExtractor:
                 n_limit=self.nFeatures
             )
             return None
+        
+        elif self.kpt_type == 'ROMA':
+            repo_path = pathlib.Path(__file__).parent / "RoMa"
+            sys.path.insert(0, str(repo_path))
+            
+            from romatch import roma_outdoor
+            
+            self.roma_model = roma_outdoor(
+                device=self.device
+            )
+            return None
 
         else:
             raise ValueError(f"Unsupported method: {self.kpt_type}")
@@ -317,7 +328,7 @@ class KeypointExtractor:
         # ============================================================
         #  Dense matcher — no keypoints from extract_keypoints
         # ============================================================
-        elif self.kpt_type == 'LOFTR':
+        elif self.kpt_type in ['LOFTR', 'ROMA']:
             return [], None
 
         # XFeat -> detect_and_match
@@ -330,7 +341,7 @@ class KeypointExtractor:
     # ------------------------------------------------------------------ #
     #  Dense matching (LoFTR)
     # ------------------------------------------------------------------ #
-    def match_dense(self, img1, img2, conf_threshold=0.5):
+    def match_dense_loftr(self, img1, img2, conf_threshold=0.5):
         assert self.kpt_type == 'LOFTR', "match_dense for LOFTR use only"
 
         def _to_tensor(img):
@@ -341,6 +352,27 @@ class KeypointExtractor:
             out = self.loftr_model({'image0': _to_tensor(img1), 'image1': _to_tensor(img2)})
         mask = out['confidence'].cpu().numpy() >= conf_threshold
         return out['keypoints0'].cpu().numpy()[mask], out['keypoints1'].cpu().numpy()[mask]
+
+    # ------------------------------------------------------------------ #
+    #  Dense matching (RoMa)
+    # ------------------------------------------------------------------ #
+    def match_dense_roma(self, img1, img2, conf_threshold=0.5):
+        H1, W1 = img1.shape[:2]
+        H2, W2 = img2.shape[:2]
+
+        with torch.no_grad():
+            wrap, certainty = self.roma_model.match(img1, img2, device=self.device)
+            
+            matches, certainty = self.roma_model.sample(wrap, certainty)
+        
+        certainty = certainty.cpu().numpy()
+        mask = certainty >= conf_threshold
+        matches = matches[mask]
+        certainty = certainty[mask]
+        
+        kpts1, kpts2 = self.roma_model.to_pixel_coordinates(matches, W1, H1, W2, H2)
+        
+        return kpts1.cpu().numpy().astype(np.float32), kpts2.cpu().numpy().astype(np.float32), certainty.cpu().numpy().astype(np.float32)
 
     # ------------------------------------------------------------------ #
     #  Detect + Match
@@ -363,7 +395,13 @@ class KeypointExtractor:
             n_kp1, n_kp2 = len(out1['keypoints']), len(out2['keypoints'])
 
         elif self.kpt_type == 'LOFTR':
-            pts1, pts2 = self.match_dense(img1, img2)
+            pts1, pts2 = self.match_dense_loftr(img1, img2)
+            t_extract = time.perf_counter() - t_start
+            t_match = 0.0
+            n_kp1, n_kp2 = len(pts1), len(pts2)
+
+        elif self.kpt_type == 'ROMA':
+            pts1, pts2, conf = self.match_dense_roma(img1, img2)
             t_extract = time.perf_counter() - t_start
             t_match = 0.0
             n_kp1, n_kp2 = len(pts1), len(pts2)
