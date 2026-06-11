@@ -10,8 +10,8 @@ class KeypointExtractor:
     def __init__(self, kpt_type, nFeatures=3000):
         self.kpt_type = kpt_type.upper()
         self.nFeatures = nFeatures
-        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.device = torch.device('cpu')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #self.device = torch.device('cpu')
         self.detector = self._get_detector()
 
     # ------------------------------------------------------------------ #
@@ -91,7 +91,20 @@ class KeypointExtractor:
             }
             self.superpoint_model = SuperPoint(config).to(self.device).eval()
             return None
+        
+        elif self.kpt_type == 'SUPERGLUE':
+            config = {
+                'nms_radius': 4,
+                'keypoint_threshold': 0.005,
+                'max_keypoints': self.nFeatures
+            }
 
+            self.superpoint_model = SuperPoint(config).to(self.device).eval()
+
+            self.lightglue = KF.LightGlueMatcher("superpoint")
+
+            return None
+        
         # ---- External repos ----
         elif self.kpt_type == 'R2D2':
             repo_path = pathlib.Path(__file__).parent / "r2d2"
@@ -137,19 +150,51 @@ class KeypointExtractor:
             )
             return None
         
-        elif self.kpt_type == 'ROMA':
-            repo_path = pathlib.Path(__file__).parent / "RoMa"
+        elif self.kpt_type == 'DEDODE':
+            repo_path = pathlib.Path(__file__).parent / "DeDoDe"
             sys.path.insert(0, str(repo_path))
             
-            from romatch import roma_outdoor
+            from DeDoDe import dedode_detector_L, dedode_descriptor_B
+            from DeDoDe.matchers.dual_softmax_matcher import DualSoftMaxMatcher
             
-            self.roma_model = roma_outdoor(
-                device=self.device
-            )
+            # load weights
+            det_weight_path = repo_path / "weights" / "dedode_detector_L.pth"
+            desc_weight_path = repo_path / "weights" / "dedode_descriptor_B.pth"
+            
+            # load state_dict
+            det_state_dict = torch.load(det_weight_path, map_location=self.device)
+            desc_state_dict = torch.load(desc_weight_path, map_location=self.device)
+            
+            self.dedode_detector = dedode_detector_L(weights=det_state_dict).to(self.device).eval()
+            self.dedode_descriptor = dedode_descriptor_B(weights=desc_state_dict).to(self.device).eval()
+            
+            self.dedode_matcher = DualSoftMaxMatcher()
+            
             return None
+        
+        elif self.kpt_type == 'DKM':
+            repo_path = pathlib.Path(__file__).parent / "DKM"
+            sys.path.insert(0, str(repo_path))
 
+            from dkm import DKMv3_outdoor
+
+            self.dkm_model = DKMv3_outdoor()
+
+            self.dkm_model.upsample_preds = True
+            self.dkm_model.symmetric = True
+
+            return None
+        
         else:
             raise ValueError(f"Unsupported method: {self.kpt_type}")
+
+    def _compute_brief_or_none(self, gray, kps):
+        try:
+            brief = cv2.xfeatures2d.BriefDescriptorExtractor_create()
+            kps, desc = brief.compute(gray, kps)
+            return kps, desc
+        except Exception:
+            return kps, None
 
     # ------------------------------------------------------------------ #
     #  Keypoint extraction
@@ -166,23 +211,17 @@ class KeypointExtractor:
             if corners is None:
                 return [], None
             kps = [cv2.KeyPoint(float(c[0][0]), float(c[0][1]), 5) for c in corners]
-            brief = cv2.xfeatures2d.BriefDescriptorExtractor_create()
-            kps, desc = brief.compute(gray, kps)
-            return kps, desc
+            return self._compute_brief_or_none(gray, kps)
 
         elif self.kpt_type == 'FAST':
             kps = self.detector.detect(gray, None)
             kps = sorted(kps, key=lambda k: -k.response)[:self.nFeatures]
-            brief = cv2.xfeatures2d.BriefDescriptorExtractor_create()
-            kps, desc = brief.compute(gray, kps)
-            return kps, desc
+            return self._compute_brief_or_none(gray, kps)
 
         elif self.kpt_type == 'AGAST':
             kps = self.detector.detect(gray, None)
             kps = sorted(kps, key=lambda k: -k.response)[:self.nFeatures]
-            brief = cv2.xfeatures2d.BriefDescriptorExtractor_create()
-            kps, desc = brief.compute(gray, kps)
-            return kps, desc
+            return self._compute_brief_or_none(gray, kps)
 
         elif self.kpt_type == 'MSER':
             msers, _ = self._mser.detectRegions(gray)
@@ -222,7 +261,7 @@ class KeypointExtractor:
             kps = [cv2.KeyPoint(float(k[0]), float(k[1]), 1) for k in kp_array]
             return kps, desc
 
-        elif self.kpt_type == 'SUPERPOINT':
+        elif self.kpt_type in ['SUPERPOINT', 'SUPERGLUE']:
             tensor = torch.from_numpy(gray).float().unsqueeze(0).unsqueeze(0).to(self.device) / 255.0
             
             with torch.no_grad():
@@ -328,16 +367,68 @@ class KeypointExtractor:
         # ============================================================
         #  Dense matcher — no keypoints from extract_keypoints
         # ============================================================
-        elif self.kpt_type in ['LOFTR', 'ROMA']:
+        elif self.kpt_type in ['LOFTR', 'ROMA', 'DKM']:
             return [], None
 
         # XFeat -> detect_and_match
         elif self.kpt_type == 'XFEAT':
             raise RuntimeError("XFeat use detect_and_match(), not extract_keypoints()")
+        
+        elif self.kpt_type == 'DEDODE':
+            from PIL import Image
+            import torchvision.transforms as transforms
+            
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            pil_img = Image.fromarray(rgb)
+            W, H = pil_img.size  
+            
+            transform = transforms.ToTensor()
+            tensor = transform(pil_img).unsqueeze(0).to(self.device)
 
+            with torch.no_grad():
+                det = self.dedode_detector.detect(
+                    {"image": tensor}, 
+                    num_keypoints=self.nFeatures
+                )
+
+            # normalize keypoints to pixel coordinates
+            kps_tensor = self.dedode_detector.to_pixel_coords(det["keypoints"], H, W)
+            kps = kps_tensor[0].cpu().numpy()
+            conf = det["confidence"][0].cpu().numpy() if "confidence" in det else None
+
+            kps_cv = [cv2.KeyPoint(float(p[0]), float(p[1]), 1) for p in kps]
+
+            return kps_cv, conf
+        
         else:
             raise ValueError(f"Unsupported method in extract_keypoints: {self.kpt_type}")
+    
+    # ------------------------------------------------------------------ #
+    #  superpoint extract_keypoints for superglue (no descriptor from extract_keypoints)
+    # ------------------------------------------------------------------ #
+    def _extract_superpoint(self, img):
 
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        tensor = (
+            torch.from_numpy(gray)
+            .float()
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(self.device)
+            / 255.0
+        )
+
+        with torch.no_grad():
+            out = self.superpoint_model(
+                {'image': tensor}
+            )
+
+        return (
+            out['keypoints'][0],
+            out['descriptors'][0].permute(1,0)
+        )
+    
     # ------------------------------------------------------------------ #
     #  Dense matching (LoFTR)
     # ------------------------------------------------------------------ #
@@ -373,7 +464,45 @@ class KeypointExtractor:
         kpts1, kpts2 = self.roma_model.to_pixel_coordinates(matches, W1, H1, W2, H2)
         
         return kpts1.cpu().numpy().astype(np.float32), kpts2.cpu().numpy().astype(np.float32), certainty.cpu().numpy().astype(np.float32)
+    
+    # ------------------------------------------------------------------ #
+    #  Dense matching (DKM)
+    # ------------------------------------------------------------------ #
+    def match_dense_dkm(self, img1, img2, conf_threshold=0.05):
+        H1,W1 = img1.shape[:2]
+        H2,W2 = img2.shape[:2]
 
+        with torch.no_grad():
+
+            warp, certainty = self.dkm_model.match(
+                img1,
+                img2,
+                device=self.device
+            )
+
+            matches, certainty = self.dkm_model.sample(
+                warp,
+                certainty
+            )
+
+        mask = certainty >= conf_threshold
+
+        matches = matches[mask]
+        certainty = certainty[mask]
+
+        kpts1, kpts2 = self.dkm_model.to_pixel_coordinates(
+            matches,
+            H1,W1,
+            H2,W2
+        )
+
+        return (
+            kpts1.cpu().numpy().astype(np.float32),
+            kpts2.cpu().numpy().astype(np.float32),
+            certainty.cpu().numpy().astype(np.float32)
+        )
+    
+    
     # ------------------------------------------------------------------ #
     #  Detect + Match
     # ------------------------------------------------------------------ #
@@ -406,6 +535,98 @@ class KeypointExtractor:
             t_match = 0.0
             n_kp1, n_kp2 = len(pts1), len(pts2)
 
+        elif self.kpt_type == 'SUPERGLUE':
+            kp0, desc0 = self._extract_superpoint(img1)
+            kp1, desc1 = self._extract_superpoint(img2)
+
+            t_extract = time.perf_counter() - t_start
+            t1 = time.perf_counter()
+
+            # LightGlue expects BxNxD
+            desc0 = desc0.unsqueeze(0)
+            desc1 = desc1.unsqueeze(0)
+
+            lafs0 = KF.laf_from_center_scale_ori(
+                kp0.unsqueeze(0),
+                torch.ones(1,len(kp0),1,1,device=self.device),
+                torch.zeros(1,len(kp0),1,device=self.device)
+            )
+
+            lafs1 = KF.laf_from_center_scale_ori(
+                kp1.unsqueeze(0),
+                torch.ones(1,len(kp1),1,1,device=self.device),
+                torch.zeros(1,len(kp1),1,device=self.device)
+            )
+
+            _, matches = self.lightglue(desc0, desc1, lafs0, lafs1)
+            matches = matches[0].cpu().numpy()
+
+            pts1 = kp0[matches[:, 0]].cpu().numpy().astype(np.float32)
+            pts2 = kp1[matches[:, 1]].cpu().numpy().astype(np.float32)
+
+            t_match = time.perf_counter() - t1
+
+            n_kp1 = len(kp0)
+            n_kp2 = len(kp1)
+        
+        elif self.kpt_type == 'DKM':
+            pts1, pts2, conf = self.match_dense_dkm(img1, img2)
+            t_extract = time.perf_counter() - t_start
+            t_match = 0.0
+            n_kp1, n_kp2 = len(pts1), len(pts2)    
+            
+        elif self.kpt_type == 'DEDODE':
+            from PIL import Image
+            import torchvision.transforms as transforms
+            
+            def _prep_dedode_tensor(img):
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                pil_img = Image.fromarray(rgb)
+                return transforms.ToTensor()(pil_img).unsqueeze(0).to(self.device)
+
+            tensor1 = _prep_dedode_tensor(img1)
+            tensor2 = _prep_dedode_tensor(img2)
+            
+            # --- 1. Extract ---
+            with torch.no_grad():
+                # detect Keypoints
+                det1 = self.dedode_detector.detect({"image": tensor1}, num_keypoints=self.nFeatures)
+                det2 = self.dedode_detector.detect({"image": tensor2}, num_keypoints=self.nFeatures)
+                
+                det1["image"], det2["image"] = tensor1, tensor2
+                
+                # generate Descriptors
+                desc1_out = self.dedode_descriptor.describe(det1)
+                desc2_out = self.dedode_descriptor.describe(det2)
+
+            t_extract = time.perf_counter() - t_start
+
+            # --- 2. Match ---
+            t1 = time.perf_counter()
+            with torch.no_grad():
+                matches_dict = self.dedode_matcher.match(
+                    {"keypoints": desc1_out["keypoints"], "descriptions": desc1_out["descriptions"]}, 
+                    {"keypoints": desc2_out["keypoints"], "descriptions": desc2_out["descriptions"]}
+                )
+            
+            matches = matches_dict["matches0"][0].cpu().numpy()
+            
+            kps1 = desc1_out["keypoints"][0].cpu().numpy()
+            kps2 = desc2_out["keypoints"][0].cpu().numpy()
+            
+            # filter out unmatched keypoints (matches == -1)
+            valid_m = matches != -1
+            match_idx1 = np.where(valid_m)[0]
+            match_idx2 = matches[valid_m]
+
+            pts1 = kps1[match_idx1].astype(np.float32)
+            pts2 = kps2[match_idx2].astype(np.float32)
+
+            t_match = time.perf_counter() - t1
+
+            n_kp1 = len(kps1)
+            n_kp2 = len(kps2)
+            
         else:
             kp1, desc1 = self.extract_keypoints(img1)
             kp2, desc2 = self.extract_keypoints(img2)
@@ -435,8 +656,8 @@ class KeypointExtractor:
             return []
 
         HAMMING_TYPES = {'ORB', 'BRISK', 'HARRIS', 'FAST', 'AGAST', 'MSER', 'AKAZE'}
-        L2_KNN_TYPES  = {'SIFT', 'DISK', 'GFTT', 'SUPERPOINT',
-                         'KEYNET', 'ALIKE', 'R2D2', 'D2NET', 'KAZE'}
+        L2_KNN_TYPES  = {'SIFT', 'DISK', 'GFTT', 'SUPERPOINT', 'KEYNET',
+                          'ALIKE', 'R2D2', 'D2NET', 'KAZE'}
 
         if self.kpt_type in HAMMING_TYPES:
             bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
